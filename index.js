@@ -1,0 +1,1016 @@
+// Cloudflare Worker for Tax & Airbnb Accounting
+// Optimized for Fast Execution via Cloudflare D1 with Month/Quarter Automation
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const TARGET_PATH = '/987rhfkwjscdgm347364rgyeubdfcjsk4efwhi/tax';
+
+    if (!url.pathname.startsWith(TARGET_PATH)) {
+      return new Response('Not Found', { status: 404 });
+    }
+
+    // --- DEBUG LOGGING SETUP ---
+    let debugLogs = [];
+    const log = (msg) => {
+      const time = new Date().toISOString().split('T')[1].split('.')[0];
+      const logMsg = `[${time}] ${msg}`;
+      debugLogs.push(logMsg);
+      console.log(logMsg);
+    };
+
+    log(`Worker elindult. Metódus: ${request.method}`);
+
+    let startDateParam, endDateParam, apartmentName, outputType, periodLabel = '';
+
+    if (request.method === 'POST') {
+      const formData = await request.formData();
+      const monthValue = formData.get('month');
+      const quarterValue = formData.get('quarter');
+      const customStart = formData.get('customStartDate');
+      const customEnd = formData.get('customEndDate');
+
+      apartmentName = formData.get('apartment') || 'Everything';
+      outputType = formData.get('outputType') || 'table';
+
+      if (customStart && customEnd) {
+        startDateParam = customStart.trim();
+        endDateParam = customEnd.trim();
+        periodLabel = `Egyedi (${startDateParam} - ${endDateParam})`;
+      } else if (monthValue) {
+        const parts = monthValue.split('|');
+        startDateParam = parts[0];
+        endDateParam = parts[1];
+        periodLabel = parts[2] || 'Hónap';
+      } else if (quarterValue) {
+        const parts = quarterValue.split('|');
+        startDateParam = parts[0];
+        endDateParam = parts[1];
+        periodLabel = parts[2] || 'Negyedév';
+      }
+    } else {
+      const customStart = url.searchParams.get('customStartDate');
+      const customEnd = url.searchParams.get('customEndDate');
+      const monthValue = url.searchParams.get('month');
+      const quarterValue = url.searchParams.get('quarter');
+
+      apartmentName = url.searchParams.get('apartment') || 'Everything';
+      outputType = url.searchParams.get('outputType') || 'table';
+
+      if (customStart && customEnd) {
+        startDateParam = customStart.trim();
+        endDateParam = customEnd.trim();
+        periodLabel = `Egyedi (${startDateParam} - ${endDateParam})`;
+      } else if (monthValue) {
+        const parts = monthValue.split('|');
+        startDateParam = parts[0];
+        endDateParam = parts[1];
+        periodLabel = parts[2] || 'Hónap';
+      } else if (quarterValue) {
+        const parts = quarterValue.split('|');
+        startDateParam = parts[0];
+        endDateParam = parts[1];
+        periodLabel = parts[2] || 'Negyedév';
+      }
+    }
+
+    // Ha nincsenek paraméterek, az űrlap jelenik meg
+    if (!startDateParam || !endDateParam) {
+      log('Nincsenek dátum paraméterek, űrlap megjelenítése.');
+      return new Response(getHtmlForm(TARGET_PATH), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    log(`Lekérdezés: Kezdés=${startDateParam}, Vége=${endDateParam}, Apartman=${apartmentName}, Időszak=${periodLabel}`);
+
+    // Dátum ellenőrzés
+    const startDate = new Date(startDateParam + 'T00:00:00Z');
+    const endDate = new Date(endDateParam + 'T23:59:59Z');
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return renderErrorPage('Érvénytelen dátum formátum.', debugLogs);
+    }
+
+    const allApartmentNames = ['The Tucan', 'The Colibri', 'The Albatros', 'The Pirate', 'The Banana'];
+    const apartmentNamesForFilter = apartmentName === 'Everything' ? allApartmentNames : [apartmentName];
+
+    let allBookingData = [];
+
+    // 1. Elsődleges és ultragyors forrás: Cloudflare D1 adatbázis
+    try {
+      if (env.DB) {
+        log(`==> D1 adatbázis lekérdezése (${startDateParam} - ${endDateParam})...`);
+        let sql = `SELECT * FROM tax_bookings WHERE arrival >= ? AND arrival <= ?`;
+        const sqlParams = [startDateParam, endDateParam];
+
+        if (apartmentName !== 'Everything') {
+          sql += ` AND property_name = ?`;
+          sqlParams.push(apartmentName);
+        }
+        sql += ` ORDER BY arrival ASC`;
+
+        const queryRes = await env.DB.prepare(sql).bind(...sqlParams).all();
+        const rows = queryRes.results || [];
+        log(`<== D1 találatok száma: ${rows.length}`);
+
+        for (const row of rows) {
+          const departureDate = new Date(row.departure + 'T00:00:00Z');
+          const arrivalDate = new Date(row.arrival + 'T00:00:00Z');
+          const totalAmount = parseFloat(row.total_amount) || 0;
+          const totalAmountTimes015 = totalAmount * 0.15;
+          const totalAmountTimes085 = totalAmount * 0.85;
+
+          const formattedDepartureDate = formatDateHU(departureDate);
+          const formattedBankDate = row.bank_arrival_date ? formatDateHU(new Date(row.bank_arrival_date + 'T00:00:00Z')) : '';
+
+          allBookingData.push({
+            confirmationCode: row.confirmation_code || 'N/A',
+            arrivalDateValue: arrivalDate.getTime(),
+            departureDateValue: departureDate.getTime(),
+            formattedDepartureDate,
+            nights: row.nights || 0,
+            guestName: row.guest_name || '',
+            totalAmount,
+            totalAmountTimes015,
+            totalAmountTimes085,
+            formattedArrivalDatePlusOneDay: formattedBankDate,
+            propertyName: row.property_name
+          });
+        }
+      }
+    } catch (d1Err) {
+      log(`[FIGYELMEZTETÉS] D1 lekérdezési hiba: ${d1Err.message}`);
+    }
+
+    log(`Összes feldolgozott foglalás: ${allBookingData.length}`);
+
+    // Rendezés érkezési dátum / bankba érkezés szerint növekvő sorrendbe (1-től 30-ig)
+    allBookingData.sort((a, b) => a.arrivalDateValue - b.arrivalDateValue);
+
+    const headers = [
+      'Foglalási szám',
+      'Kijelentkezés dátuma',
+      'Éjszakák száma',
+      'Vendég neve',
+      'Vendég által fizetett teljes díj',
+      'Booking/AirBnB jutaléka (15%)',
+      'Kezelési költség',
+      'Bankszámlára érkezett összeg (85%)',
+      'Bankba érkezés dátuma'
+    ];
+
+    const totalNights = allBookingData.reduce((sum, item) => sum + item.nights, 0);
+    const totalGuestPaid = allBookingData.reduce((sum, item) => sum + item.totalAmount, 0);
+    const totalCommission = allBookingData.reduce((sum, item) => sum + item.totalAmountTimes015, 0);
+    const totalBankszamlara = allBookingData.reduce((sum, item) => sum + item.totalAmountTimes085, 0);
+
+    const formattedTotals = {
+      totalNights,
+      totalGuestPaid: `€${totalGuestPaid.toFixed(2)}`,
+      totalCommission: `€${totalCommission.toFixed(2)}`,
+      totalBankszamlara: `€${totalBankszamlara.toFixed(2)}`
+    };
+
+    const headerApartmanName = apartmentName === 'Everything' ? 'Összes Apartman' : apartmentName;
+    const tableHeader = `KUNDOLF FERENC, 164 ${headerApartmanName} - ${periodLabel}`;
+    const filenameSafe = `KUNDOLF_FERENC_164_${headerApartmanName.replace(/ /g, '_')}_${periodLabel.replace(/ /g, '_').replace(/[^a-zA-Z0-9áéíóöőúüűÁÉÍÓÖŐÚÜŰ_-]/g, '-')}`;
+
+    // --- CSV KIMENET ---
+    if (outputType === 'csv') {
+      log('Kimenet formátuma: CSV');
+
+      if (apartmentName === 'Everything') {
+        let combinedCsvContent = '\uFEFF'; // UTF-8 BOM Excelhez
+
+        for (const name of allApartmentNames) {
+          const apartmentData = allBookingData.filter(item => item.propertyName === name);
+
+          if (apartmentData.length > 0) {
+            const aptTotals = {
+              totalNights: apartmentData.reduce((sum, item) => sum + item.nights, 0),
+              totalGuestPaid: `€${apartmentData.reduce((sum, item) => sum + item.totalAmount, 0).toFixed(2)}`,
+              totalCommission: `€${apartmentData.reduce((sum, item) => sum + item.totalAmountTimes015, 0).toFixed(2)}`,
+              totalBankszamlara: `€${apartmentData.reduce((sum, item) => sum + item.totalAmountTimes085, 0).toFixed(2)}`
+            };
+
+            const aptHeader = `KUNDOLF FERENC, 164 ${name} - ${periodLabel}`;
+            const csvBlock = generateCsv(apartmentData, headers, aptTotals, aptHeader, true);
+            combinedCsvContent += csvBlock + '\n\n';
+          }
+        }
+
+        const grandTotalRow = [
+          'NAGY ÖSSZESEN:',
+          '',
+          formattedTotals.totalNights,
+          '',
+          formattedTotals.totalGuestPaid,
+          formattedTotals.totalCommission,
+          '€0.00',
+          formattedTotals.totalBankszamlara,
+          ''
+        ].map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',');
+
+        combinedCsvContent += `\n${grandTotalRow}\n`;
+
+        return new Response(combinedCsvContent, {
+          headers: {
+            'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': `attachment; filename="${filenameSafe}.csv"`,
+          },
+        });
+      }
+
+      const csvContent = '\uFEFF' + generateCsv(allBookingData, headers, formattedTotals, tableHeader);
+      return new Response(csvContent, {
+        headers: {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': `attachment; filename="${filenameSafe}.csv"`,
+        },
+      });
+    }
+
+    // --- HTML TÁBLÁZAT KIMENET ---
+    log('Kimenet formátuma: HTML Táblázat');
+    const htmlTable = generateHtmlTable(
+      allBookingData,
+      headers,
+      formattedTotals,
+      tableHeader,
+      apartmentName,
+      allApartmentNames,
+      periodLabel,
+      startDateParam,
+      endDateParam,
+      TARGET_PATH,
+      debugLogs
+    );
+
+    return new Response(htmlTable, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  }
+};
+
+// --- DÁTUM SEGÉDFÜGGVÉNYEK ---
+
+function formatDateHU(date) {
+  if (!date || isNaN(date.getTime())) return '';
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${d}.${m}.${y}`;
+}
+
+function getMonthData() {
+  const monthsHu = [
+    'Január', 'Február', 'Március', 'Április', 'Május', 'Június',
+    'Július', 'Augusztus', 'Szeptember', 'Október', 'November', 'December'
+  ];
+  const currentYear = new Date().getFullYear();
+  const years = [currentYear - 1, currentYear, currentYear + 1];
+  const list = [];
+
+  for (const y of years) {
+    for (let m = 1; m <= 12; m++) {
+      // Könyvelési szabály az Airbnb kifizetésekhez:
+      // Az adott hónap első banki befizetése az előző hónap utolsó napján érkezett vendég után jön (+1 nap)
+      const prevMonthLastDay = new Date(Date.UTC(y, m - 1, 0));
+      // Az adott hónap utolsó napján bejelentkező vendég pénze már a következő hónapban érkezik!
+      // Ezért az utolsó beszámító érkezési nap: a tárgyhó utolsó napja előtti nap (penultimate day)
+      const currMonthLastDay = new Date(Date.UTC(y, m, 0));
+      const penultimateDay = new Date(Date.UTC(y, m, -1));
+
+      const startStr = prevMonthLastDay.toISOString().split('T')[0];
+      const endStr = penultimateDay.toISOString().split('T')[0];
+
+      const bankStartStr = `${y}-${String(m).padStart(2, '0')}-01`;
+      const bankEndStr = currMonthLastDay.toISOString().split('T')[0];
+
+      const monthName = monthsHu[m - 1];
+      const periodLabel = `${y} ${monthName}`;
+      const label = `${y} ${monthName} (Érkezés: ${startStr} – ${endStr} | Bank: ${bankStartStr} – ${bankEndStr})`;
+
+      list.push({
+        year: y,
+        month: m,
+        periodLabel,
+        label,
+        value: `${startStr}|${endStr}|${periodLabel}`,
+        startStr,
+        endStr,
+        bankStartStr,
+        bankEndStr
+      });
+    }
+  }
+  return list;
+}
+
+function getQuarterData() {
+  const years = [2025, 2026, 2027];
+  const quartersConfig = [
+    { q: 'Q1', endMonth: 3, endDay: 31 },
+    { q: 'Q2', endMonth: 6, endDay: 30 },
+    { q: 'Q3', endMonth: 9, endDay: 30 },
+    { q: 'Q4', endMonth: 12, endDay: 31 }
+  ];
+
+  const list = [];
+  for (const y of years) {
+    for (const item of quartersConfig) {
+      const qNum = parseInt(item.q.replace('Q', ''), 10);
+      const startMonth = (qNum - 1) * 3; // 0, 3, 6, 9
+      const prevQuarterLastDay = new Date(Date.UTC(y, startMonth, 0));
+      const currQuarterLastDay = new Date(Date.UTC(y, item.endMonth, 0));
+      const penultimateDay = new Date(Date.UTC(y, item.endMonth, -1));
+
+      const startStr = prevQuarterLastDay.toISOString().split('T')[0];
+      const endStr = penultimateDay.toISOString().split('T')[0];
+
+      const label = `${item.q} (${y}): ${formatDateHU(prevQuarterLastDay)} – ${formatDateHU(penultimateDay)}`;
+      list.push({
+        q: item.q,
+        year: y,
+        label,
+        value: `${startStr}|${endStr}|${item.q} (${y})`,
+        startStr,
+        endStr
+      });
+    }
+  }
+  return list;
+}
+
+// --- CSV GENERÁLÁS ---
+
+function generateCsv(data, headers, totals, tableHeader, separate = false) {
+  const csvRows = [];
+
+  if (separate) {
+    csvRows.push('');
+  }
+
+  csvRows.push(`"${tableHeader.replace(/"/g, '""')}"`);
+  csvRows.push(headers.map(h => `"${h.replace(/"/g, '""')}"`).join(','));
+
+  for (const item of data) {
+    const row = [
+      item.confirmationCode,
+      item.formattedDepartureDate,
+      item.nights,
+      item.guestName,
+      `€${item.totalAmount.toFixed(2)}`,
+      `€${item.totalAmountTimes015.toFixed(2)}`,
+      `€0.00`,
+      `€${item.totalAmountTimes085.toFixed(2)}`,
+      item.formattedArrivalDatePlusOneDay
+    ];
+
+    const escapedRow = row.map(cell => {
+      let processedCell = String(cell).replace(/"/g, '""');
+      if (processedCell.match(/[,\s€]/) || processedCell.includes('\n')) {
+        return `"${processedCell}"`;
+      }
+      return processedCell;
+    });
+    csvRows.push(escapedRow.join(','));
+  }
+
+  const totalRow = [
+    'Összesen:',
+    '',
+    totals.totalNights,
+    '',
+    totals.totalGuestPaid,
+    totals.totalCommission,
+    `€0.00`,
+    totals.totalBankszamlara,
+    ''
+  ];
+
+  const escapedTotalRow = totalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`);
+  csvRows.push(escapedTotalRow.join(','));
+
+  return csvRows.join('\n');
+}
+
+// --- HTML TÁBLÁZAT MEGJELENÍTÉSE ---
+
+function generateHtmlTable(
+  data,
+  headers,
+  totals,
+  tableHeader,
+  apartmentName,
+  allApartmentNames,
+  periodLabel,
+  startDateParam,
+  endDateParam,
+  targetPath,
+  debugLogs
+) {
+  const isEverything = apartmentName === 'Everything';
+
+  return `<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Adó- és Könyvelési Adatok - ${tableHeader}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --success: #10b981;
+      --accent: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    .header-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-bottom: 24px;
+      background: white;
+      padding: 20px 24px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    h1 { font-size: 20px; font-weight: 700; color: var(--text); }
+    .actions { display: flex; gap: 12px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 18px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 8px;
+      text-decoration: none;
+      border: none;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-secondary { background: #f1f5f9; color: var(--text); border: 1px solid var(--border); }
+    .btn-secondary:hover { background: #e2e8f0; }
+
+    /* Summary KPI Cards */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .kpi-card {
+      background: white;
+      padding: 18px 20px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .kpi-title { font-size: 13px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .kpi-value { font-size: 24px; font-weight: 700; color: var(--text); margin-top: 6px; }
+    .kpi-value.green { color: #059669; }
+    .kpi-value.blue { color: #2563eb; }
+    .kpi-value.orange { color: #d97706; }
+
+    /* Info Badge */
+    .info-box {
+      background: #eff6ff;
+      border-left: 4px solid var(--primary);
+      padding: 12px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      color: #1e40af;
+      margin-bottom: 24px;
+    }
+
+    /* Tables */
+    .table-section {
+      background: white;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      margin-bottom: 30px;
+      overflow: hidden;
+    }
+    .table-section-title {
+      padding: 16px 20px;
+      font-size: 16px;
+      font-weight: 700;
+      background: #f8fafc;
+      border-bottom: 1px solid var(--border);
+      color: #334155;
+    }
+    .table-responsive { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+    th {
+      background: #f1f5f9;
+      color: #475569;
+      font-weight: 600;
+      padding: 12px 16px;
+      border-bottom: 2px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      color: #1e293b;
+      white-space: nowrap;
+    }
+    tr:nth-child(even) { background-color: #f8fafc; }
+    tr:hover { background-color: #f1f5f9; }
+    .total-row td {
+      font-weight: 700;
+      background: #e2e8f0 !important;
+      border-top: 2px solid #cbd5e1;
+      color: #0f172a;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      background: #e0f2fe;
+      color: #0369a1;
+    }
+
+    /* Debug */
+    details { margin-top: 30px; background: white; padding: 16px; border-radius: 8px; border: 1px solid var(--border); }
+    summary { font-weight: 600; cursor: pointer; color: var(--text-muted); }
+    textarea { width: 100%; height: 180px; font-family: monospace; font-size: 12px; margin-top: 10px; padding: 10px; background: #0f172a; color: #38bdf8; border-radius: 6px; }
+
+    @media print {
+      body { background: white; padding: 0; }
+      .header-bar .actions, details { display: none !important; }
+      .table-section { box-shadow: none; border: 1px solid #000; }
+      th, td { border: 1px solid #ccc; font-size: 11px; padding: 6px 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-bar">
+      <div>
+        <h1>${tableHeader}</h1>
+        <div style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">
+          Foglalási időszak: <strong>${startDateParam} – ${endDateParam}</strong>
+        </div>
+      </div>
+      <div class="actions">
+        <a href="${targetPath}" class="btn btn-secondary">🔍 Új Lekérdezés</a>
+        <a href="${targetPath}?customStartDate=${startDateParam}&customEndDate=${endDateParam}&apartment=${encodeURIComponent(apartmentName)}&outputType=csv" class="btn btn-primary">
+          📥 CSV Letöltése
+        </a>
+      </div>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-title">Összes Éjszaka</div>
+        <div class="kpi-value blue">${totals.totalNights} éj</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">Vendég által fizetett összeg</div>
+        <div class="kpi-value">${totals.totalGuestPaid}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">Airbnb Jutalék (15%)</div>
+        <div class="kpi-value orange">${totals.totalCommission}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">Bankszámlára érkezett (85%)</div>
+        <div class="kpi-value green">${totals.totalBankszamlara}</div>
+      </div>
+    </div>
+
+    <div class="info-box">
+      💡 <strong>Könyvelési automatizmus:</strong> Az Airbnb az érkezést (Check-in) követő napon utal a bankszámlára.
+      Ezért a hónap első jóváírása az előző hónap utolsó napján érkezett vendég után esedékes, míg a hónap utolsó napján érkező vendég díja már a következő hónapban érkezik a bankszámlára.
+    </div>
+
+    ${isEverything ? renderEverythingApartments(data, headers, allApartmentNames, periodLabel, totals) : renderSingleApartmentTable(data, headers, totals, tableHeader)}
+
+    <details>
+      <summary>Rendszernaplók (Debug Logok)</summary>
+      <textarea readonly>${debugLogs.join('\n')}</textarea>
+    </details>
+  </div>
+</body>
+</html>`;
+}
+
+function renderSingleApartmentTable(data, headers, totals, title) {
+  return `
+  <div class="table-section">
+    <div class="table-responsive">
+      <table>
+        <thead>
+          <tr>
+            ${headers.map(h => `<th>${h}</th>`).join('')}
+          </tr>
+        </thead>
+        <tbody>
+          ${data.length === 0 ? `<tr><td colspan="${headers.length}" style="text-align: center; padding: 30px; color: #94a3b8;">Nincs találat ebben az időszakban.</td></tr>` : ''}
+          ${data.map(item => `
+            <tr>
+              <td><span class="badge">${item.confirmationCode}</span></td>
+              <td>${item.formattedDepartureDate}</td>
+              <td>${item.nights}</td>
+              <td><strong>${item.guestName}</strong></td>
+              <td>€${item.totalAmount.toFixed(2)}</td>
+              <td>€${item.totalAmountTimes015.toFixed(2)}</td>
+              <td>€0.00</td>
+              <td><strong>€${item.totalAmountTimes085.toFixed(2)}</strong></td>
+              <td>${item.formattedArrivalDatePlusOneDay}</td>
+            </tr>
+          `).join('')}
+          <tr class="total-row">
+            <td>ÖSSZESEN:</td>
+            <td></td>
+            <td>${totals.totalNights}</td>
+            <td></td>
+            <td>${totals.totalGuestPaid}</td>
+            <td>${totals.totalCommission}</td>
+            <td>€0.00</td>
+            <td>${totals.totalBankszamlara}</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function renderEverythingApartments(data, headers, apartmentNames, periodLabel, grandTotals) {
+  let html = '';
+
+  for (const name of apartmentNames) {
+    const aptData = data.filter(i => i.propertyName === name);
+    if (aptData.length === 0) continue;
+
+    const aptTotals = {
+      totalNights: aptData.reduce((sum, item) => sum + item.nights, 0),
+      totalGuestPaid: `€${aptData.reduce((sum, item) => sum + item.totalAmount, 0).toFixed(2)}`,
+      totalCommission: `€${aptData.reduce((sum, item) => sum + item.totalAmountTimes015, 0).toFixed(2)}`,
+      totalBankszamlara: `€${aptData.reduce((sum, item) => sum + item.totalAmountTimes085, 0).toFixed(2)}`
+    };
+
+    html += `
+    <div class="table-section">
+      <div class="table-section-title">🏡 ${name} - ${periodLabel} (${aptData.length} foglalás)</div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              ${headers.map(h => `<th>${h}</th>`).join('')}
+            </tr>
+          </thead>
+          <tbody>
+            ${aptData.map(item => `
+              <tr>
+                <td><span class="badge">${item.confirmationCode}</span></td>
+                <td>${item.formattedDepartureDate}</td>
+                <td>${item.nights}</td>
+                <td><strong>${item.guestName}</strong></td>
+                <td>€${item.totalAmount.toFixed(2)}</td>
+                <td>€${item.totalAmountTimes015.toFixed(2)}</td>
+                <td>€0.00</td>
+                <td><strong>€${item.totalAmountTimes085.toFixed(2)}</strong></td>
+                <td>${item.formattedArrivalDatePlusOneDay}</td>
+              </tr>
+            `).join('')}
+            <tr class="total-row">
+              <td>${name} ÖSSZESEN:</td>
+              <td></td>
+              <td>${aptTotals.totalNights}</td>
+              <td></td>
+              <td>${aptTotals.totalGuestPaid}</td>
+              <td>${aptTotals.totalCommission}</td>
+              <td>€0.00</td>
+              <td>${aptTotals.totalBankszamlara}</td>
+              <td></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+  }
+
+  // Nagy összesen blokk
+  html += `
+  <div class="table-section" style="border: 2px solid var(--primary);">
+    <div class="table-section-title" style="background: #eff6ff; color: var(--primary);">⭐ NAGY ÖSSZESEN (Minden Apartman Együtt)</div>
+    <div class="table-responsive">
+      <table>
+        <thead>
+          <tr>
+            ${headers.map(h => `<th>${h}</th>`).join('')}
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="total-row" style="font-size: 15px;">
+            <td>NAGY ÖSSZESEN:</td>
+            <td></td>
+            <td>${grandTotals.totalNights}</td>
+            <td></td>
+            <td>${grandTotals.totalGuestPaid}</td>
+            <td>${grandTotals.totalCommission}</td>
+            <td>€0.00</td>
+            <td>${grandTotals.totalBankszamlara}</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+
+  return html;
+}
+
+// --- FORM MEGJELENÍTÉSE ---
+
+function getHtmlForm(targetPath) {
+  const apartmentNames = ['Everything', 'The Tucan', 'The Colibri', 'The Albatros', 'The Pirate', 'The Banana'];
+  const monthsData = getMonthData();
+  const quartersData = getQuarterData();
+
+  const now = new Date();
+  const currentY = now.getFullYear();
+  const currentM = now.getMonth() + 1;
+  const defaultMonthObj = monthsData.find(m => m.year === currentY && m.month === currentM) || monthsData[monthsData.length - 1];
+  const defaultMonthValue = defaultMonthObj ? defaultMonthObj.value : '';
+
+  return `<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Airbnb Adó- és Könyvelési Lekérdező</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --bg: #f1f5f9;
+      --card-bg: #ffffff;
+      --border: #cbd5e1;
+      --text: #0f172a;
+      --text-muted: #64748b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .form-container {
+      width: 100%;
+      max-width: 650px;
+      background: white;
+      padding: 36px;
+      border-radius: 16px;
+      box-shadow: 0 10px 25px -5px rgba(0,0,0,0.08), 0 8px 10px -6px rgba(0,0,0,0.04);
+      border: 1px solid var(--border);
+    }
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+    p.subtitle {
+      font-size: 14px;
+      color: var(--text-muted);
+      margin-bottom: 24px;
+    }
+    .form-group { margin-bottom: 20px; }
+    label {
+      display: block;
+      font-weight: 600;
+      font-size: 14px;
+      color: #334155;
+      margin-bottom: 8px;
+    }
+    select, input[type="text"] {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 15px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: white;
+      color: var(--text);
+      transition: border-color 0.2s;
+    }
+    select:focus, input[type="text"]:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37,99,235,0.15);
+    }
+    .help-card {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 13px;
+      color: #1e40af;
+      margin-top: 10px;
+      line-height: 1.5;
+    }
+    .help-card strong { color: #1e3a8a; }
+    .or-divider {
+      display: flex;
+      align-items: center;
+      text-align: center;
+      margin: 24px 0 16px 0;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .or-divider::before, .or-divider::after {
+      content: '';
+      flex: 1;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    .or-divider:not(:empty)::before { margin-right: 12px; }
+    .or-divider:not(:empty)::after { margin-left: 12px; }
+    .date-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    button.submit-btn {
+      width: 100%;
+      background: var(--primary);
+      color: white;
+      padding: 14px;
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 24px;
+      transition: background-color 0.2s, transform 0.1s;
+    }
+    button.submit-btn:hover { background: var(--primary-hover); }
+    button.submit-btn:active { transform: scale(0.99); }
+  </style>
+</head>
+<body>
+  <div class="form-container">
+    <h1>🗓️ Airbnb Adó- és Könyvelési Lekérdező</h1>
+    <p class="subtitle">Automatikus könyvelési dátumok az Airbnb banki jóváírási logikája alapján.</p>
+
+    <form method="POST" action="${targetPath}">
+      <!-- 1. Hónap választó (Ajánlott) -->
+      <div class="form-group">
+        <label for="month">Könyvelési Hónap (Ajánlott - 1 Hónap Adat):</label>
+        <select id="month" name="month" onchange="onMonthChange(this.value)">
+          <option value="">-- Válassz egy hónapot --</option>
+          ${monthsData.map(m => `
+            <option value="${m.value}" ${m.value === defaultMonthValue ? 'selected' : ''}>
+              ${m.label}
+            </option>
+          `).join('')}
+        </select>
+
+        <div id="monthHelp" class="help-card">
+          📅 <strong>Automatikus banki dátum-illesztés:</strong><br>
+          Az Airbnb a vendég érkezését követő napon indítja a banki átutalást.
+          Így az adott hónap első banki jóváírása az <strong>előző hónap utolsó napján becheckolt</strong> vendégtől származik,
+          míg az <strong>adott hónap utolsó napján becheckolt</strong> vendég kifizetése már csak a következő hónapban érkezik!
+        </div>
+      </div>
+
+      <div class="or-divider">VAGY NEGYEDÉV VÁLASZTÁSA</div>
+
+      <!-- 2. Negyedév választó -->
+      <div class="form-group">
+        <label for="quarter">Negyedév (Könyvelési dátumokkal):</label>
+        <select id="quarter" name="quarter" onchange="onQuarterChange(this.value)">
+          <option value="" selected>-- Válassz egy negyedévet --</option>
+          ${quartersData.map(q => `<option value="${q.value}">${q.label}</option>`).join('')}
+        </select>
+      </div>
+
+      <div class="or-divider">VAGY EGYEDI DÁTUM MEGADÁSA</div>
+
+      <!-- 3. Egyedi dátum -->
+      <div class="date-grid">
+        <div class="form-group">
+          <label for="customStartDate">Kezdő érkezési nap:</label>
+          <input type="text" id="customStartDate" name="customStartDate" placeholder="YYYY-MM-DD (pl. 2026-08-31)">
+        </div>
+        <div class="form-group">
+          <label for="customEndDate">Záró érkezési nap:</label>
+          <input type="text" id="customEndDate" name="customEndDate" placeholder="YYYY-MM-DD (pl. 2026-09-29)">
+        </div>
+      </div>
+
+      <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+      <!-- Apartman és kimenet választó -->
+      <div class="date-grid">
+        <div class="form-group">
+          <label for="apartment">Apartman:</label>
+          <select id="apartment" name="apartment" required>
+            ${apartmentNames.map(name => `
+              <option value="${name}" ${name === 'Everything' ? 'selected' : ''}>
+                ${name === 'Everything' ? '🌟 Összes Apartman (Everything)' : name}
+              </option>
+            `).join('')}
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="outputType">Kimenet Típusa:</label>
+          <select id="outputType" name="outputType" required>
+            <option value="table" selected>📊 HTML Táblázat</option>
+            <option value="csv">📥 CSV Letöltése (Excel)</option>
+          </select>
+        </div>
+      </div>
+
+      <button type="submit" class="submit-btn">Adatok Lekérdezése →</button>
+    </form>
+  </div>
+
+  <script>
+    function onMonthChange(val) {
+      if (val) {
+        document.getElementById('quarter').value = '';
+        document.getElementById('customStartDate').value = '';
+        document.getElementById('customEndDate').value = '';
+      }
+    }
+    function onQuarterChange(val) {
+      if (val) {
+        document.getElementById('month').value = '';
+        document.getElementById('customStartDate').value = '';
+        document.getElementById('customEndDate').value = '';
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
+
+function renderErrorPage(errorMsg, debugLogs) {
+  return new Response(`
+    <!DOCTYPE html>
+    <html lang="hu">
+    <head>
+      <meta charset="UTF-8">
+      <title>Hiba történt</title>
+      <style>
+        body { font-family: sans-serif; padding: 30px; background: #fff5f5; color: #991b1b; }
+        .box { max-width: 700px; margin: 0 auto; background: white; padding: 24px; border-radius: 8px; border: 1px solid #fecaca; }
+        textarea { width: 100%; height: 300px; font-family: monospace; font-size: 12px; background: #1e293b; color: #38bdf8; padding: 10px; border-radius: 6px; }
+        button { padding: 10px 18px; background: #dc2626; color: white; border: none; border-radius: 6px; cursor: pointer; margin-top: 15px; }
+      </style>
+    </head>
+    <body>
+      <div class="box">
+        <h2>❌ Hiba történt a lekérdezés során!</h2>
+        <p><strong>Hibaüzenet:</strong> ${errorMsg}</p>
+        <h3 style="margin-top: 20px; color: #334155;">Rendszernaplók:</h3>
+        <textarea readonly>${debugLogs.join('\n')}</textarea>
+        <br><button onclick="window.history.back()">← Vissza az űrlaphoz</button>
+      </div>
+    </body>
+    </html>
+  `, {
+    status: 500,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
+}

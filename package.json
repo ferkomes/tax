@@ -1,0 +1,19 @@
+{
+  "name": "tax",
+  "version": "1.0.0",
+  "description": "Airbnb Tax Reporting & Accounting Assistant for Cloudflare Workers",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "npx wrangler deploy",
+    "sync": "node sync.js"
+  },
+  "keywords": [
+    "airbnb",
+    "tax",
+    "accounting",
+    "lodgify",
+    "cloudflare-workers"
+  ],
+  "author": "Ferenc Kundolf",
+  "license": "ISC"
+}
