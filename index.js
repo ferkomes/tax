@@ -1,262 +1,230 @@
 // Cloudflare Worker for Tax & Airbnb Accounting
 // Protected with HTTP Basic Auth (Admin / Kurvaanyad1!)
-// Exact original CSV column format & Hungarian date conventions
-// Monthly helper only (quarter selector removed as requested)
+// Clean, single-table CSV export for accountant (no repeated sub-headers or empty lines)
+// Monthly helper with automated accounting check-in window
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const TARGET_PATH = '/987rhfkwjscdgm347364rgyeubdfcjsk4efwhi/tax';
-
-    if (!url.pathname.startsWith(TARGET_PATH)) {
-      return new Response('Not Found', { status: 404 });
-    }
-
-    // --- HTTP BASIC AUTHENTICATION ---
-    const auth = authenticateUser(request);
-    if (!auth) {
-      return unauthorizedResponse();
-    }
-
-    // --- DEBUG LOGGING SETUP ---
-    let debugLogs = [];
-    const log = (msg) => {
-      const time = new Date().toISOString().split('T')[1].split('.')[0];
-      const logMsg = `[${time}] ${msg}`;
-      debugLogs.push(logMsg);
-      console.log(logMsg);
-    };
-
-    log(`Worker elindult. Felhasználó: ${auth.username}, Metódus: ${request.method}`);
-
-    let startDateParam, endDateParam, apartmentName, outputType, headerPeriodText = '';
-
-    if (request.method === 'POST') {
-      const formData = await request.formData();
-      const monthValue = formData.get('month');
-      const customStart = formData.get('customStartDate');
-      const customEnd = formData.get('customEndDate');
-
-      apartmentName = formData.get('apartment') || 'Everything';
-      outputType = formData.get('outputType') || 'table';
-
-      if (customStart && customEnd) {
-        startDateParam = customStart.trim();
-        endDateParam = customEnd.trim();
-        headerPeriodText = `${startDateParam} - ${endDateParam}`;
-      } else if (monthValue) {
-        const parts = monthValue.split('|');
-        startDateParam = parts[0];
-        endDateParam = parts[1];
-        headerPeriodText = parts[2] || `${startDateParam} - ${endDateParam}`;
-      }
-    } else {
-      const customStart = url.searchParams.get('customStartDate');
-      const customEnd = url.searchParams.get('customEndDate');
-      const monthValue = url.searchParams.get('month');
-
-      apartmentName = url.searchParams.get('apartment') || 'Everything';
-      outputType = url.searchParams.get('outputType') || 'table';
-
-      if (customStart && customEnd) {
-        startDateParam = customStart.trim();
-        endDateParam = customEnd.trim();
-        headerPeriodText = `${startDateParam} - ${endDateParam}`;
-      } else if (monthValue) {
-        const parts = monthValue.split('|');
-        startDateParam = parts[0];
-        endDateParam = parts[1];
-        headerPeriodText = parts[2] || `${startDateParam} - ${endDateParam}`;
-      }
-    }
-
-    // Ha nincsenek dátum paraméterek, megjelenítjük az űrlapot
-    if (!startDateParam || !endDateParam) {
-      log('Nincsenek dátum paraméterek, űrlap megjelenítése.');
-      return new Response(getHtmlForm(TARGET_PATH, auth.username), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      });
-    }
-
-    log(`Lekérdezés: Kezdés=${startDateParam}, Vége=${endDateParam}, Apartman=${apartmentName}, Időszak=${headerPeriodText}`);
-
-    const startDate = new Date(startDateParam + 'T00:00:00Z');
-    const endDate = new Date(endDateParam + 'T23:59:59Z');
-
-    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-      return renderErrorPage('Érvénytelen dátum formátum.', debugLogs);
-    }
-
-    const allApartmentNames = ['The Tucan', 'The Colibri', 'The Albatros', 'The Pirate', 'The Banana'];
-    let allBookingData = [];
-
-    // Adatok lekérdezése Cloudflare D1 adatbázisból
     try {
-      if (env.DB) {
-        log(`==> D1 adatbázis lekérdezése: érkezés ${startDateParam} és ${endDateParam} között...`);
-        let sql = `SELECT * FROM tax_bookings WHERE arrival >= ? AND arrival <= ?`;
-        const sqlParams = [startDateParam, endDateParam];
+      const url = new URL(request.url);
+      const TARGET_PATH = '/987rhfkwjscdgm347364rgyeubdfcjsk4efwhi/tax';
 
-        if (apartmentName !== 'Everything') {
-          sql += ` AND property_name = ?`;
-          sqlParams.push(apartmentName);
+      if (!url.pathname.startsWith(TARGET_PATH)) {
+        return new Response('Not Found', { status: 404 });
+      }
+
+      // --- HTTP BASIC AUTHENTICATION ---
+      const auth = authenticateUser(request);
+      if (!auth) {
+        return unauthorizedResponse();
+      }
+
+      // --- DEBUG LOGGING SETUP ---
+      let debugLogs = [];
+      const log = (msg) => {
+        const time = new Date().toISOString().split('T')[1].split('.')[0];
+        const logMsg = `[${time}] ${msg}`;
+        debugLogs.push(logMsg);
+        console.log(logMsg);
+      };
+
+      log(`Worker indult. Felhasználó: ${auth.username}, Metódus: ${request.method}`);
+
+      let startDateParam, endDateParam, apartmentName, outputType, headerPeriodText = '';
+
+      if (request.method === 'POST') {
+        const formData = await request.formData();
+        const monthValue = formData.get('month');
+        const customStart = formData.get('customStartDate');
+        const customEnd = formData.get('customEndDate');
+
+        apartmentName = formData.get('apartment') || 'Everything';
+        outputType = formData.get('outputType') || 'table';
+
+        if (customStart && customEnd) {
+          startDateParam = customStart.trim();
+          endDateParam = customEnd.trim();
+          headerPeriodText = `${startDateParam} - ${endDateParam}`;
+        } else if (monthValue) {
+          const parts = monthValue.split('|');
+          startDateParam = parts[0];
+          endDateParam = parts[1];
+          headerPeriodText = parts[2] || `${startDateParam} - ${endDateParam}`;
         }
-        sql += ` ORDER BY departure ASC`;
+      } else {
+        const customStart = url.searchParams.get('customStartDate');
+        const customEnd = url.searchParams.get('customEndDate');
+        const start = url.searchParams.get('startDate');
+        const end = url.searchParams.get('endDate');
+        const periodParam = url.searchParams.get('period');
+        const monthValue = url.searchParams.get('month');
 
-        const queryRes = await env.DB.prepare(sql).bind(...sqlParams).all();
-        const rows = queryRes.results || [];
-        log(`<== D1 találatok száma: ${rows.length}`);
+        apartmentName = url.searchParams.get('apartment') || 'Everything';
+        outputType = url.searchParams.get('outputType') || 'table';
 
-        for (const row of rows) {
-          const departureDate = new Date(row.departure + 'T00:00:00Z');
-          const arrivalDate = new Date(row.arrival + 'T00:00:00Z');
-
-          const arrivalDatePlusOneDay = new Date(arrivalDate);
-          arrivalDatePlusOneDay.setUTCDate(arrivalDatePlusOneDay.getUTCDate() + 1);
-
-          const formattedDepartureDate = formatHungarianDate(departureDate);
-          const formattedArrivalDatePlusOneDay = formatHungarianDate(arrivalDatePlusOneDay);
-
-          const totalAmount = parseFloat(row.total_amount) || 0;
-          const totalAmountTimes015 = totalAmount * 0.15;
-          const totalAmountTimes085 = totalAmount * 0.85;
-
-          allBookingData.push({
-            confirmationCode: row.confirmation_code || 'N/A',
-            departureDateValue: departureDate.getTime(),
-            formattedDepartureDate,
-            nights: row.nights || 0,
-            guestName: row.guest_name || '',
-            totalAmount,
-            totalAmountTimes015,
-            totalAmountTimes085,
-            formattedArrivalDatePlusOneDay,
-            propertyName: row.property_name
-          });
+        if (start && end) {
+          startDateParam = start.trim();
+          endDateParam = end.trim();
+          headerPeriodText = periodParam || `${startDateParam} - ${endDateParam}`;
+        } else if (customStart && customEnd) {
+          startDateParam = customStart.trim();
+          endDateParam = customEnd.trim();
+          headerPeriodText = `${startDateParam} - ${endDateParam}`;
+        } else if (monthValue) {
+          const parts = monthValue.split('|');
+          startDateParam = parts[0];
+          endDateParam = parts[1];
+          headerPeriodText = parts[2] || `${startDateParam} - ${endDateParam}`;
         }
       }
-    } catch (d1Err) {
-      log(`[HIBA] D1 hiba: ${d1Err.message}`);
-    }
 
-    log(`Összes feldolgozott foglalás: ${allBookingData.length}`);
+      // Ha nincsenek dátum paraméterek, megjelenítjük az űrlapot
+      if (!startDateParam || !endDateParam) {
+        log('Nincsenek dátum paraméterek, űrlap megjelenítése.');
+        return new Response(getHtmlForm(TARGET_PATH, auth.username), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
 
-    // Rendezés távozási dátum szerint növekvő sorrendbe (mint az eredetiben)
-    allBookingData.sort((a, b) => a.departureDateValue - b.departureDateValue);
+      log(`Lekérdezés: Kezdés=${startDateParam}, Vége=${endDateParam}, Apartman=${apartmentName}, Időszak=${headerPeriodText}`);
 
-    // PONTOSAN AZ EREDETI OSZLOPOK FEJLÉCEI
-    const headers = [
-      'Foglalási szám',
-      'Kijelentkezés dátuma',
-      'Éjszakák száma',
-      'Vendég neve',
-      'Vendég által fizetett teljes díj',
-      'Booking/AirBnB jutaléka',
-      'Kezelési költség',
-      'Bankszámlára érkezett összeg',
-      'Bankba érkezés dátuma'
-    ];
+      const startDate = new Date(startDateParam + 'T00:00:00Z');
+      const endDate = new Date(endDateParam + 'T23:59:59Z');
 
-    const totalNights = allBookingData.reduce((sum, item) => sum + item.nights, 0);
-    const totalGuestPaid = allBookingData.reduce((sum, item) => sum + item.totalAmount, 0);
-    const totalCommission = allBookingData.reduce((sum, item) => sum + item.totalAmountTimes015, 0);
-    const totalBankszamlara = allBookingData.reduce((sum, item) => sum + item.totalAmountTimes085, 0);
+      if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+        return renderErrorPage('Érvénytelen dátum formátum.', debugLogs);
+      }
 
-    const formattedTotals = {
-      totalNights,
-      totalGuestPaid: `€${totalGuestPaid.toFixed(2)}`,
-      totalCommission: `€${totalCommission.toFixed(2)}`,
-      totalBankszamlara: `€${totalBankszamlara.toFixed(2)}`
-    };
+      const allApartmentNames = ['The Tucan', 'The Colibri', 'The Albatros', 'The Pirate', 'The Banana'];
+      let allBookingData = [];
 
-    const headerApartmanName = apartmentName === 'Everything' ? 'Összes Apartman' : apartmentName;
-    const tableHeader = `KUNDOLF FERENC, 164 ${headerApartmanName} - ${headerPeriodText}`;
-    const filenameBase = `KUNDOLF_FERENC_164_${headerApartmanName.replace(/ /g, '_').replace(/[^a-zA-Z0-9áéíóöőúüűÁÉÍÓÖŐÚÜŰ_]/g, '')}_${headerPeriodText.replace(/ /g, '_').replace(/[^a-zA-Z0-9áéíóöőúüűÁÉÍÓÖŐÚÜŰ_]/g, '-')}`;
+      // Adatok lekérdezése Cloudflare D1 adatbázisból
+      try {
+        if (env.DB) {
+          log(`==> D1 lekérdezése: érkezés ${startDateParam} és ${endDateParam} között...`);
+          let sql = `SELECT * FROM tax_bookings WHERE arrival >= ? AND arrival <= ?`;
+          const sqlParams = [startDateParam, endDateParam];
 
-    // --- CSV LETÖLTÉS (PONTOSAN AZ EREDETI FORMÁTUMBAN) ---
-    if (outputType === 'csv') {
-      log('Kimenet formátuma: CSV');
+          if (apartmentName !== 'Everything') {
+            sql += ` AND property_name = ?`;
+            sqlParams.push(apartmentName);
+          }
+          sql += ` ORDER BY departure ASC`;
 
-      if (apartmentName === 'Everything') {
-        let combinedCsvContent = '\uFEFF';
+          const queryRes = await env.DB.prepare(sql).bind(...sqlParams).all();
+          const rows = queryRes.results || [];
+          log(`<== D1 találatok száma: ${rows.length}`);
 
-        for (const name of allApartmentNames) {
-          const apartmentData = allBookingData.filter(item => item.propertyName === name);
+          for (const row of rows) {
+            const departureDate = new Date(row.departure + 'T00:00:00Z');
+            const arrivalDate = new Date(row.arrival + 'T00:00:00Z');
 
-          if (apartmentData.length > 0) {
-            const aptTotals = {
-              totalNights: apartmentData.reduce((sum, item) => sum + item.nights, 0),
-              totalGuestPaid: apartmentData.reduce((sum, item) => sum + item.totalAmount, 0),
-              totalCommission: apartmentData.reduce((sum, item) => sum + item.totalAmountTimes015, 0),
-              totalBankszamlara: apartmentData.reduce((sum, item) => sum + item.totalAmountTimes085, 0)
-            };
+            const arrivalDatePlusOneDay = new Date(arrivalDate);
+            arrivalDatePlusOneDay.setUTCDate(arrivalDatePlusOneDay.getUTCDate() + 1);
 
-            const formattedAptTotals = {
-              totalNights: aptTotals.totalNights,
-              totalGuestPaid: `€${aptTotals.totalGuestPaid.toFixed(2)}`,
-              totalCommission: `€${aptTotals.totalCommission.toFixed(2)}`,
-              totalBankszamlara: `€${aptTotals.totalBankszamlara.toFixed(2)}`
-            };
+            const formattedDepartureDate = formatHungarianDate(departureDate);
+            const formattedArrivalDatePlusOneDay = formatHungarianDate(arrivalDatePlusOneDay);
 
-            const aptHeader = `KUNDOLF FERENC, 164 ${name} - ${headerPeriodText}`;
-            const csvBlock = generateCsv(apartmentData, headers, formattedAptTotals, aptHeader, true);
-            combinedCsvContent += csvBlock;
+            const totalAmount = parseFloat(row.total_amount) || 0;
+            const totalAmountTimes015 = totalAmount * 0.15;
+            const totalAmountTimes085 = totalAmount * 0.85;
+
+            allBookingData.push({
+              confirmationCode: row.confirmation_code || 'N/A',
+              departureDateValue: departureDate.getTime(),
+              formattedDepartureDate,
+              nights: row.nights || 0,
+              guestName: row.guest_name || '',
+              totalAmount,
+              totalAmountTimes015,
+              totalAmountTimes085,
+              formattedArrivalDatePlusOneDay,
+              propertyName: row.property_name
+            });
           }
         }
+      } catch (d1Err) {
+        log(`[HIBA] D1 hiba: ${d1Err.message}`);
+      }
 
-        const grandTotalRow = [
-          'NAGY ÖSSZESEN:',
-          '',
-          formattedTotals.totalNights,
-          '',
-          formattedTotals.totalGuestPaid,
-          formattedTotals.totalCommission,
-          `€0.00`,
-          formattedTotals.totalBankszamlara,
-          ''
-        ].map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',');
+      log(`Összes feldolgozott foglalás: ${allBookingData.length}`);
 
-        combinedCsvContent += `\n\n${grandTotalRow}\n`;
+      // Rendezés távozási dátum szerint növekvő sorrendbe (mint az eredeti kódban)
+      allBookingData.sort((a, b) => a.departureDateValue - b.departureDateValue);
 
-        const combinedFilename = `KUNDOLF_FERENC_164_OSSZES_APARTMAN_${filenameBase}.csv`;
+      // PONTOSAN AZ EREDETI OSZLOPOK FEJLÉCEI
+      const headers = [
+        'Foglalási szám',
+        'Kijelentkezés dátuma',
+        'Éjszakák száma',
+        'Vendég neve',
+        'Vendég által fizetett teljes díj',
+        'Booking/AirBnB jutaléka',
+        'Kezelési költség',
+        'Bankszámlára érkezett összeg',
+        'Bankba érkezés dátuma'
+      ];
 
-        return new Response(combinedCsvContent, {
+      const totalNights = allBookingData.reduce((sum, item) => sum + item.nights, 0);
+      const totalGuestPaid = allBookingData.reduce((sum, item) => sum + item.totalAmount, 0);
+      const totalCommission = allBookingData.reduce((sum, item) => sum + item.totalAmountTimes015, 0);
+      const totalBankszamlara = allBookingData.reduce((sum, item) => sum + item.totalAmountTimes085, 0);
+
+      const formattedTotals = {
+        totalNights,
+        totalGuestPaid: `€${totalGuestPaid.toFixed(2)}`,
+        totalCommission: `€${totalCommission.toFixed(2)}`,
+        totalBankszamlara: `€${totalBankszamlara.toFixed(2)}`
+      };
+
+      const headerApartmanName = apartmentName === 'Everything' ? 'Összes Apartman' : apartmentName;
+      const tableHeader = `KUNDOLF FERENC, 164 ${headerApartmanName} - ${headerPeriodText}`;
+
+      // --- CSV LETÖLTÉS (EGYSÉGES, TISZTA, FÖLÖSLEGES ISMÉTLŐDÉSEKTŐL MENTES TÁBLÁZAT) ---
+      if (outputType === 'csv') {
+        log('Kimenet formátuma: CSV');
+
+        // Egyetlen egységes táblázat generálása: nincs 5-ször ismétlődő fejléc vagy üres sor
+        const csvContent = '\uFEFF' + generateCleanCsv(allBookingData, headers, formattedTotals, tableHeader);
+
+        // Biztonságos ASCII fájlnév az HTTP fejléchez (kizárja a Cloudflare ByteString hibát)
+        const safeBase = sanitizeAscii(`KUNDOLF_FERENC_164_${headerApartmanName}_${headerPeriodText}`);
+        const filename = `${safeBase}.csv`;
+
+        return new Response(csvContent, {
           headers: {
             'Content-Type': 'text/csv; charset=utf-8',
-            'Content-Disposition': `attachment; filename="${combinedFilename}"`,
+            'Content-Disposition': `attachment; filename="${filename}"`,
           },
         });
       }
 
-      const csvContent = '\uFEFF' + generateCsv(allBookingData, headers, formattedTotals, tableHeader);
-      return new Response(csvContent, {
-        headers: {
-          'Content-Type': 'text/csv; charset=utf-8',
-          'Content-Disposition': `attachment; filename="${filenameBase}.csv"`,
-        },
+      // --- HTML TÁBLÁZAT KIMENET ---
+      log('Kimenet formátuma: HTML Táblázat');
+      const htmlTable = generateHtmlTable(
+        allBookingData,
+        headers,
+        formattedTotals,
+        tableHeader,
+        apartmentName,
+        allApartmentNames,
+        headerPeriodText,
+        startDateParam,
+        endDateParam,
+        TARGET_PATH,
+        debugLogs,
+        auth.username
+      );
+
+      return new Response(htmlTable, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    } catch (fatalErr) {
+      return new Response(`Szerverhiba:\n${fatalErr.message}\n\nStack:\n${fatalErr.stack}`, {
+        status: 500,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
       });
     }
-
-    // --- HTML TÁBLÁZAT KIMENET ---
-    log('Kimenet formátuma: HTML Táblázat');
-    const htmlTable = generateHtmlTable(
-      allBookingData,
-      headers,
-      formattedTotals,
-      tableHeader,
-      apartmentName,
-      allApartmentNames,
-      headerPeriodText,
-      startDateParam,
-      endDateParam,
-      TARGET_PATH,
-      debugLogs,
-      auth.username
-    );
-
-    return new Response(htmlTable, {
-      headers: { 'Content-Type': 'text/html; charset=utf-8' },
-    });
   }
 };
 
@@ -298,7 +266,14 @@ function unauthorizedResponse(msg = 'Hozzáférés megtagadva: Kérlek jelentkez
   });
 }
 
-// --- DÁTUM SEGÉDFÜGGVÉNYEK ---
+// --- DÁTUM ÉS SZÖVEG SEGÉDFÜGGVÉNYEK ---
+
+function sanitizeAscii(str) {
+  return String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9_.-]/g, '_');
+}
 
 function formatHungarianDate(date) {
   if (!date || isNaN(date.getTime())) return '';
@@ -349,18 +324,18 @@ function getMonthData() {
   return list;
 }
 
-// --- CSV GENERÁLÁS (PONTOSAN AZ EREDETI OSZLOPOKKAL ÉS STRUKTÚRÁVAL) ---
-
-function generateCsv(data, headers, totals, tableHeader, separate = false) {
+// --- TISZTA, EGYSÉGES CSV GENERÁLÁS A KÖNYVELŐNEK ---
+// Nincs benne semmi fölösleges: 1 címsor, 1 fejlécsor, az adatsorok, és 1 Összesen sor a végén.
+function generateCleanCsv(data, headers, totals, tableHeader) {
   const csvRows = [];
 
-  if (separate) {
-    csvRows.push('\n');
-  }
-
+  // 1. Cím sor
   csvRows.push(`"${tableHeader.replace(/"/g, '""')}"`);
+
+  // 2. Pontos oszlopfejlécek
   csvRows.push(headers.map(h => `"${h.replace(/"/g, '""')}"`).join(','));
 
+  // 3. Foglalási adatsorok
   for (const item of data) {
     const row = [
       item.confirmationCode,
@@ -384,6 +359,7 @@ function generateCsv(data, headers, totals, tableHeader, separate = false) {
     csvRows.push(escapedRow.join(','));
   }
 
+  // 4. Egyetlen Összesen sor a táblázat legalján
   const totalRow = [
     'Összesen:',
     '',
@@ -396,10 +372,7 @@ function generateCsv(data, headers, totals, tableHeader, separate = false) {
     ''
   ];
 
-  const escapedTotalRow = totalRow.map(cell => {
-    let processedCell = String(cell).replace(/"/g, '""');
-    return `"${processedCell}"`;
-  });
+  const escapedTotalRow = totalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`);
   csvRows.push(escapedTotalRow.join(','));
 
   return csvRows.join('\n');
@@ -422,6 +395,7 @@ function generateHtmlTable(
   username
 ) {
   const isEverything = apartmentName === 'Everything';
+  const csvDownloadUrl = `${targetPath}?startDate=${startDateParam}&endDate=${endDateParam}&apartment=${encodeURIComponent(apartmentName)}&period=${encodeURIComponent(headerPeriodText)}&outputType=csv`;
 
   return `<!DOCTYPE html>
 <html lang="hu">
@@ -601,7 +575,7 @@ function generateHtmlTable(
       <div class="actions">
         <span class="user-badge">👤 ${username}</span>
         <a href="${targetPath}" class="btn btn-secondary">🔍 Új Lekérdezés</a>
-        <a href="${targetPath}?customStartDate=${startDateParam}&customEndDate=${endDateParam}&apartment=${encodeURIComponent(apartmentName)}&outputType=csv" class="btn btn-primary">
+        <a href="${csvDownloadUrl}" class="btn btn-primary">
           📥 CSV Letöltése (Excel)
         </a>
       </div>
