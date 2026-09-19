@@ -30,7 +30,7 @@ export default {
 
       log(`Worker indult. Felhasználó: ${auth.username}, Metódus: ${request.method}`);
 
-      let startDateParam, endDateParam, apartmentName, outputType, headerPeriodText = '';
+      let startDateParam, endDateParam, apartmentName, outputType, delim, headerPeriodText = '';
 
       if (request.method === 'POST') {
         const formData = await request.formData();
@@ -40,6 +40,8 @@ export default {
 
         apartmentName = formData.get('apartment') || 'Everything';
         outputType = formData.get('outputType') || 'table';
+        delim = formData.get('delim') || (outputType === 'csv-comma' ? 'comma' : 'semicolon');
+        if (outputType === 'csv-comma') outputType = 'csv';
 
         if (customStart && customEnd) {
           startDateParam = customStart.trim();
@@ -61,6 +63,8 @@ export default {
 
         apartmentName = url.searchParams.get('apartment') || 'Everything';
         outputType = url.searchParams.get('outputType') || 'table';
+        delim = url.searchParams.get('delim') || (outputType === 'csv-comma' ? 'comma' : 'semicolon');
+        if (outputType === 'csv-comma') outputType = 'csv';
 
         if (start && end) {
           startDateParam = start.trim();
@@ -185,7 +189,8 @@ export default {
         log('Kimenet formátuma: CSV');
 
         // Egyetlen egységes táblázat generálása: nincs 5-ször ismétlődő fejléc vagy üres sor
-        const csvContent = '\uFEFF' + generateApartmentGroupedCsv(allBookingData, headers, apartmentName, allApartmentNames, startDateParam, endDateParam, headerPeriodText, formattedTotals);
+        const sepChar = delim === 'comma' ? ',' : ';';
+        const csvContent = '\uFEFF' + generateApartmentGroupedCsv(allBookingData, headers, apartmentName, allApartmentNames, startDateParam, endDateParam, headerPeriodText, formattedTotals, sepChar);
 
         // Biztonságos ASCII fájlnév az HTTP fejléchez (kizárja a Cloudflare ByteString hibát)
         const safeBase = sanitizeAscii(`KUNDOLF_FERENC_${headerApartmanName}_${headerPeriodText}`);
@@ -325,17 +330,18 @@ function getMonthData() {
 }
 
 // --- APARTMANONKÉNT CSOPORTOSÍTOTT CSV GENERÁLÁS A KÖNYVELŐNEK ---
-function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentNames, startDateParam, endDateParam, headerPeriodText, totals) {
+function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentNames, startDateParam, endDateParam, headerPeriodText, totals, delim = ';') {
   const csvRows = [];
   const periodRange = `${startDateParam} - ${endDateParam}`;
+  const emptyCols = delim.repeat(headers.length - 1);
 
   const renderApartmentBlock = (aptName, aptData) => {
-    // 1. Apartman címsor (pl. KUNDOLF FERENC, The Tucan - 2026-06-30 - 2026-07-30)
+    // 1. Apartman címsor (mind a 9 oszlop lefedve, hogy az Excel véletlenül se gondolja rögzített szélességűnek)
     const aptHeader = `KUNDOLF FERENC, ${aptName} - ${periodRange}`;
-    csvRows.push(`"${aptHeader.replace(/"/g, '""')}"`);
+    csvRows.push(`"${aptHeader.replace(/"/g, '""')}"` + emptyCols);
 
     // 2. Oszlopfejlécek
-    csvRows.push(headers.map(h => `"${h.replace(/"/g, '""')}"`).join(','));
+    csvRows.push(headers.map(h => `"${h.replace(/"/g, '""')}"`).join(delim));
 
     // 3. Foglalások növekvő távozási sorrendben
     const sorted = [...aptData].sort((a, b) => a.departureDateValue - b.departureDateValue);
@@ -352,14 +358,8 @@ function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentN
         item.formattedArrivalDatePlusOneDay
       ];
 
-      const escapedRow = row.map(cell => {
-        let processedCell = String(cell).replace(/"/g, '""');
-        if (processedCell.match(/[,\s€]/) || processedCell.includes('\n')) {
-          return `"${processedCell}"`;
-        }
-        return processedCell;
-      });
-      csvRows.push(escapedRow.join(','));
+      const escapedRow = row.map(cell => `"${String(cell).replace(/"/g, '""')}"`);
+      csvRows.push(escapedRow.join(delim));
     }
 
     // 4. Apartman Összesen sor (pontosan az oszlopok alá igazítva)
@@ -379,7 +379,7 @@ function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentN
       `€${aptBankszamlara.toFixed(2)}`,
       ''
     ];
-    csvRows.push(totalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','));
+    csvRows.push(totalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(delim));
   };
 
   if (apartmentName === 'Everything') {
@@ -388,7 +388,7 @@ function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentN
       const aptData = data.filter(item => item.propertyName === apt);
       if (aptData.length > 0) {
         if (renderedCount > 0) {
-          csvRows.push(''); // Üres elválasztó sor az apartmanok között
+          csvRows.push(emptyCols); // Üres elválasztó sor a blokkok között (9 üres oszlop)
         }
         renderApartmentBlock(apt, aptData);
         renderedCount++;
@@ -397,7 +397,7 @@ function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentN
 
     // Végén a NAGY ÖSSZESEN sor
     if (renderedCount > 0) {
-      csvRows.push('');
+      csvRows.push(emptyCols);
       const grandTotalRow = [
         'NAGY ÖSSZESEN:',
         '',
@@ -409,7 +409,7 @@ function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentN
         totals.totalBankszamlara,
         ''
       ];
-      csvRows.push(grandTotalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','));
+      csvRows.push(grandTotalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(delim));
     }
   } else {
     renderApartmentBlock(apartmentName, data);
@@ -615,8 +615,11 @@ function generateHtmlTable(
       <div class="actions">
         <span class="user-badge">👤 ${username}</span>
         <a href="${targetPath}" class="btn btn-secondary">🔍 Új Lekérdezés</a>
-        <a href="${csvDownloadUrl}" class="btn btn-primary">
-          📥 CSV Letöltése (Excel)
+        <a href="${csvDownloadUrl}&delim=semicolon" class="btn btn-primary" title="Magyar nyelvű Excelhez ajánlott (pontosvesszővel elválasztva)">
+          📥 CSV Letöltése (Excel / Pontosvessző ;)
+        </a>
+        <a href="${csvDownloadUrl}&delim=comma" class="btn btn-secondary" title="Vesszővel elválasztott CSV">
+          📥 CSV (Vesszővel ,)
         </a>
       </div>
     </div>
@@ -995,7 +998,8 @@ function getHtmlForm(targetPath, username) {
           <label for="outputType">Kimenet Típusa:</label>
           <select id="outputType" name="outputType" required>
             <option value="table" selected>📊 HTML Táblázat</option>
-            <option value="csv">📥 CSV Letöltése (Excel)</option>
+            <option value="csv">📥 CSV Letöltése (Excel - pontosvessző ;)</option>
+            <option value="csv-comma">📥 CSV Letöltése (Vessző ,)</option>
           </select>
         </div>
       </div>
