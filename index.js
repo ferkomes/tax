@@ -178,17 +178,17 @@ export default {
       };
 
       const headerApartmanName = apartmentName === 'Everything' ? 'Összes Apartman' : apartmentName;
-      const tableHeader = `KUNDOLF FERENC, 164 ${headerApartmanName} - ${headerPeriodText}`;
+      const tableHeader = `KUNDOLF FERENC, ${headerApartmanName} - ${headerPeriodText}`;
 
       // --- CSV LETÖLTÉS (EGYSÉGES, TISZTA, FÖLÖSLEGES ISMÉTLŐDÉSEKTŐL MENTES TÁBLÁZAT) ---
       if (outputType === 'csv') {
         log('Kimenet formátuma: CSV');
 
         // Egyetlen egységes táblázat generálása: nincs 5-ször ismétlődő fejléc vagy üres sor
-        const csvContent = '\uFEFF' + generateCleanCsv(allBookingData, headers, formattedTotals, tableHeader);
+        const csvContent = '\uFEFF' + generateApartmentGroupedCsv(allBookingData, headers, apartmentName, allApartmentNames, startDateParam, endDateParam, headerPeriodText, formattedTotals);
 
         // Biztonságos ASCII fájlnév az HTTP fejléchez (kizárja a Cloudflare ByteString hibát)
-        const safeBase = sanitizeAscii(`KUNDOLF_FERENC_164_${headerApartmanName}_${headerPeriodText}`);
+        const safeBase = sanitizeAscii(`KUNDOLF_FERENC_${headerApartmanName}_${headerPeriodText}`);
         const filename = `${safeBase}.csv`;
 
         return new Response(csvContent, {
@@ -324,56 +324,96 @@ function getMonthData() {
   return list;
 }
 
-// --- TISZTA, EGYSÉGES CSV GENERÁLÁS A KÖNYVELŐNEK ---
-// Nincs benne semmi fölösleges: 1 címsor, 1 fejlécsor, az adatsorok, és 1 Összesen sor a végén.
-function generateCleanCsv(data, headers, totals, tableHeader) {
+// --- APARTMANONKÉNT CSOPORTOSÍTOTT CSV GENERÁLÁS A KÖNYVELŐNEK ---
+function generateApartmentGroupedCsv(data, headers, apartmentName, allApartmentNames, startDateParam, endDateParam, headerPeriodText, totals) {
   const csvRows = [];
+  const periodRange = `${startDateParam} - ${endDateParam}`;
 
-  // 1. Cím sor
-  csvRows.push(`"${tableHeader.replace(/"/g, '""')}"`);
+  const renderApartmentBlock = (aptName, aptData) => {
+    // 1. Apartman címsor (pl. KUNDOLF FERENC, The Tucan - 2026-06-30 - 2026-07-30)
+    const aptHeader = `KUNDOLF FERENC, ${aptName} - ${periodRange}`;
+    csvRows.push(`"${aptHeader.replace(/"/g, '""')}"`);
 
-  // 2. Pontos oszlopfejlécek
-  csvRows.push(headers.map(h => `"${h.replace(/"/g, '""')}"`).join(','));
+    // 2. Oszlopfejlécek
+    csvRows.push(headers.map(h => `"${h.replace(/"/g, '""')}"`).join(','));
 
-  // 3. Foglalási adatsorok
-  for (const item of data) {
-    const row = [
-      item.confirmationCode,
-      item.formattedDepartureDate,
-      item.nights,
-      item.guestName,
-      `€${item.totalAmount.toFixed(2)}`,
-      `€${item.totalAmountTimes015.toFixed(2)}`,
-      `€0.00`,
-      `€${item.totalAmountTimes085.toFixed(2)}`,
-      item.formattedArrivalDatePlusOneDay
+    // 3. Foglalások növekvő távozási sorrendben
+    const sorted = [...aptData].sort((a, b) => a.departureDateValue - b.departureDateValue);
+    for (const item of sorted) {
+      const row = [
+        item.confirmationCode,
+        item.formattedDepartureDate,
+        item.nights,
+        item.guestName,
+        `€${item.totalAmount.toFixed(2)}`,
+        `€${item.totalAmountTimes015.toFixed(2)}`,
+        '€0.00',
+        `€${item.totalAmountTimes085.toFixed(2)}`,
+        item.formattedArrivalDatePlusOneDay
+      ];
+
+      const escapedRow = row.map(cell => {
+        let processedCell = String(cell).replace(/"/g, '""');
+        if (processedCell.match(/[,\s€]/) || processedCell.includes('\n')) {
+          return `"${processedCell}"`;
+        }
+        return processedCell;
+      });
+      csvRows.push(escapedRow.join(','));
+    }
+
+    // 4. Apartman Összesen sor (pontosan az oszlopok alá igazítva)
+    const aptTotalNights = aptData.reduce((sum, item) => sum + item.nights, 0);
+    const aptGuestPaid = aptData.reduce((sum, item) => sum + item.totalAmount, 0);
+    const aptCommission = aptData.reduce((sum, item) => sum + item.totalAmountTimes015, 0);
+    const aptBankszamlara = aptData.reduce((sum, item) => sum + item.totalAmountTimes085, 0);
+
+    const totalRow = [
+      'Összesen:',
+      '',
+      aptTotalNights,
+      '',
+      `€${aptGuestPaid.toFixed(2)}`,
+      `€${aptCommission.toFixed(2)}`,
+      '€0.00',
+      `€${aptBankszamlara.toFixed(2)}`,
+      ''
     ];
+    csvRows.push(totalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','));
+  };
 
-    const escapedRow = row.map(cell => {
-      let processedCell = String(cell).replace(/"/g, '""');
-      if (processedCell.match(/[,\s€]/) || processedCell.includes('\n')) {
-        return `"${processedCell}"`;
+  if (apartmentName === 'Everything') {
+    let renderedCount = 0;
+    for (const apt of allApartmentNames) {
+      const aptData = data.filter(item => item.propertyName === apt);
+      if (aptData.length > 0) {
+        if (renderedCount > 0) {
+          csvRows.push(''); // Üres elválasztó sor az apartmanok között
+        }
+        renderApartmentBlock(apt, aptData);
+        renderedCount++;
       }
-      return processedCell;
-    });
-    csvRows.push(escapedRow.join(','));
+    }
+
+    // Végén a NAGY ÖSSZESEN sor
+    if (renderedCount > 0) {
+      csvRows.push('');
+      const grandTotalRow = [
+        'NAGY ÖSSZESEN:',
+        '',
+        totals.totalNights,
+        '',
+        totals.totalGuestPaid,
+        totals.totalCommission,
+        '€0.00',
+        totals.totalBankszamlara,
+        ''
+      ];
+      csvRows.push(grandTotalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','));
+    }
+  } else {
+    renderApartmentBlock(apartmentName, data);
   }
-
-  // 4. Egyetlen Összesen sor a táblázat legalján
-  const totalRow = [
-    'Összesen:',
-    '',
-    totals.totalNights,
-    '',
-    totals.totalGuestPaid,
-    totals.totalCommission,
-    `€0.00`,
-    totals.totalBankszamlara,
-    ''
-  ];
-
-  const escapedTotalRow = totalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`);
-  csvRows.push(escapedTotalRow.join(','));
 
   return csvRows.join('\n');
 }
