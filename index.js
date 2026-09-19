@@ -1,5 +1,7 @@
 // Cloudflare Worker for Tax & Airbnb Accounting
-// Optimized for Fast Execution via Cloudflare D1 with Month/Quarter Automation
+// Protected with HTTP Basic Auth (Admin / Kurvaanyad1!)
+// Exact original CSV column format & Hungarian date conventions
+// Monthly helper only (quarter selector removed as requested)
 
 export default {
   async fetch(request, env) {
@@ -8,6 +10,12 @@ export default {
 
     if (!url.pathname.startsWith(TARGET_PATH)) {
       return new Response('Not Found', { status: 404 });
+    }
+
+    // --- HTTP BASIC AUTHENTICATION ---
+    const auth = authenticateUser(request);
+    if (!auth) {
+      return unauthorizedResponse();
     }
 
     // --- DEBUG LOGGING SETUP ---
@@ -19,14 +27,13 @@ export default {
       console.log(logMsg);
     };
 
-    log(`Worker elindult. Metódus: ${request.method}`);
+    log(`Worker elindult. Felhasználó: ${auth.username}, Metódus: ${request.method}`);
 
-    let startDateParam, endDateParam, apartmentName, outputType, periodLabel = '';
+    let startDateParam, endDateParam, apartmentName, outputType, headerPeriodText = '';
 
     if (request.method === 'POST') {
       const formData = await request.formData();
       const monthValue = formData.get('month');
-      const quarterValue = formData.get('quarter');
       const customStart = formData.get('customStartDate');
       const customEnd = formData.get('customEndDate');
 
@@ -36,23 +43,17 @@ export default {
       if (customStart && customEnd) {
         startDateParam = customStart.trim();
         endDateParam = customEnd.trim();
-        periodLabel = `Egyedi (${startDateParam} - ${endDateParam})`;
+        headerPeriodText = `${startDateParam} - ${endDateParam}`;
       } else if (monthValue) {
         const parts = monthValue.split('|');
         startDateParam = parts[0];
         endDateParam = parts[1];
-        periodLabel = parts[2] || 'Hónap';
-      } else if (quarterValue) {
-        const parts = quarterValue.split('|');
-        startDateParam = parts[0];
-        endDateParam = parts[1];
-        periodLabel = parts[2] || 'Negyedév';
+        headerPeriodText = parts[2] || `${startDateParam} - ${endDateParam}`;
       }
     } else {
       const customStart = url.searchParams.get('customStartDate');
       const customEnd = url.searchParams.get('customEndDate');
       const monthValue = url.searchParams.get('month');
-      const quarterValue = url.searchParams.get('quarter');
 
       apartmentName = url.searchParams.get('apartment') || 'Everything';
       outputType = url.searchParams.get('outputType') || 'table';
@@ -60,31 +61,25 @@ export default {
       if (customStart && customEnd) {
         startDateParam = customStart.trim();
         endDateParam = customEnd.trim();
-        periodLabel = `Egyedi (${startDateParam} - ${endDateParam})`;
+        headerPeriodText = `${startDateParam} - ${endDateParam}`;
       } else if (monthValue) {
         const parts = monthValue.split('|');
         startDateParam = parts[0];
         endDateParam = parts[1];
-        periodLabel = parts[2] || 'Hónap';
-      } else if (quarterValue) {
-        const parts = quarterValue.split('|');
-        startDateParam = parts[0];
-        endDateParam = parts[1];
-        periodLabel = parts[2] || 'Negyedév';
+        headerPeriodText = parts[2] || `${startDateParam} - ${endDateParam}`;
       }
     }
 
-    // Ha nincsenek paraméterek, az űrlap jelenik meg
+    // Ha nincsenek dátum paraméterek, megjelenítjük az űrlapot
     if (!startDateParam || !endDateParam) {
       log('Nincsenek dátum paraméterek, űrlap megjelenítése.');
-      return new Response(getHtmlForm(TARGET_PATH), {
+      return new Response(getHtmlForm(TARGET_PATH, auth.username), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
 
-    log(`Lekérdezés: Kezdés=${startDateParam}, Vége=${endDateParam}, Apartman=${apartmentName}, Időszak=${periodLabel}`);
+    log(`Lekérdezés: Kezdés=${startDateParam}, Vége=${endDateParam}, Apartman=${apartmentName}, Időszak=${headerPeriodText}`);
 
-    // Dátum ellenőrzés
     const startDate = new Date(startDateParam + 'T00:00:00Z');
     const endDate = new Date(endDateParam + 'T23:59:59Z');
 
@@ -93,14 +88,12 @@ export default {
     }
 
     const allApartmentNames = ['The Tucan', 'The Colibri', 'The Albatros', 'The Pirate', 'The Banana'];
-    const apartmentNamesForFilter = apartmentName === 'Everything' ? allApartmentNames : [apartmentName];
-
     let allBookingData = [];
 
-    // 1. Elsődleges és ultragyors forrás: Cloudflare D1 adatbázis
+    // Adatok lekérdezése Cloudflare D1 adatbázisból
     try {
       if (env.DB) {
-        log(`==> D1 adatbázis lekérdezése (${startDateParam} - ${endDateParam})...`);
+        log(`==> D1 adatbázis lekérdezése: érkezés ${startDateParam} és ${endDateParam} között...`);
         let sql = `SELECT * FROM tax_bookings WHERE arrival >= ? AND arrival <= ?`;
         const sqlParams = [startDateParam, endDateParam];
 
@@ -108,7 +101,7 @@ export default {
           sql += ` AND property_name = ?`;
           sqlParams.push(apartmentName);
         }
-        sql += ` ORDER BY arrival ASC`;
+        sql += ` ORDER BY departure ASC`;
 
         const queryRes = await env.DB.prepare(sql).bind(...sqlParams).all();
         const rows = queryRes.results || [];
@@ -117,16 +110,19 @@ export default {
         for (const row of rows) {
           const departureDate = new Date(row.departure + 'T00:00:00Z');
           const arrivalDate = new Date(row.arrival + 'T00:00:00Z');
+
+          const arrivalDatePlusOneDay = new Date(arrivalDate);
+          arrivalDatePlusOneDay.setUTCDate(arrivalDatePlusOneDay.getUTCDate() + 1);
+
+          const formattedDepartureDate = formatHungarianDate(departureDate);
+          const formattedArrivalDatePlusOneDay = formatHungarianDate(arrivalDatePlusOneDay);
+
           const totalAmount = parseFloat(row.total_amount) || 0;
           const totalAmountTimes015 = totalAmount * 0.15;
           const totalAmountTimes085 = totalAmount * 0.85;
 
-          const formattedDepartureDate = formatDateHU(departureDate);
-          const formattedBankDate = row.bank_arrival_date ? formatDateHU(new Date(row.bank_arrival_date + 'T00:00:00Z')) : '';
-
           allBookingData.push({
             confirmationCode: row.confirmation_code || 'N/A',
-            arrivalDateValue: arrivalDate.getTime(),
             departureDateValue: departureDate.getTime(),
             formattedDepartureDate,
             nights: row.nights || 0,
@@ -134,29 +130,30 @@ export default {
             totalAmount,
             totalAmountTimes015,
             totalAmountTimes085,
-            formattedArrivalDatePlusOneDay: formattedBankDate,
+            formattedArrivalDatePlusOneDay,
             propertyName: row.property_name
           });
         }
       }
     } catch (d1Err) {
-      log(`[FIGYELMEZTETÉS] D1 lekérdezési hiba: ${d1Err.message}`);
+      log(`[HIBA] D1 hiba: ${d1Err.message}`);
     }
 
     log(`Összes feldolgozott foglalás: ${allBookingData.length}`);
 
-    // Rendezés érkezési dátum / bankba érkezés szerint növekvő sorrendbe (1-től 30-ig)
-    allBookingData.sort((a, b) => a.arrivalDateValue - b.arrivalDateValue);
+    // Rendezés távozási dátum szerint növekvő sorrendbe (mint az eredetiben)
+    allBookingData.sort((a, b) => a.departureDateValue - b.departureDateValue);
 
+    // PONTOSAN AZ EREDETI OSZLOPOK FEJLÉCEI
     const headers = [
       'Foglalási szám',
       'Kijelentkezés dátuma',
       'Éjszakák száma',
       'Vendég neve',
       'Vendég által fizetett teljes díj',
-      'Booking/AirBnB jutaléka (15%)',
+      'Booking/AirBnB jutaléka',
       'Kezelési költség',
-      'Bankszámlára érkezett összeg (85%)',
+      'Bankszámlára érkezett összeg',
       'Bankba érkezés dátuma'
     ];
 
@@ -173,15 +170,15 @@ export default {
     };
 
     const headerApartmanName = apartmentName === 'Everything' ? 'Összes Apartman' : apartmentName;
-    const tableHeader = `KUNDOLF FERENC, 164 ${headerApartmanName} - ${periodLabel}`;
-    const filenameSafe = `KUNDOLF_FERENC_164_${headerApartmanName.replace(/ /g, '_')}_${periodLabel.replace(/ /g, '_').replace(/[^a-zA-Z0-9áéíóöőúüűÁÉÍÓÖŐÚÜŰ_-]/g, '-')}`;
+    const tableHeader = `KUNDOLF FERENC, 164 ${headerApartmanName} - ${headerPeriodText}`;
+    const filenameBase = `KUNDOLF_FERENC_164_${headerApartmanName.replace(/ /g, '_').replace(/[^a-zA-Z0-9áéíóöőúüűÁÉÍÓÖŐÚÜŰ_]/g, '')}_${headerPeriodText.replace(/ /g, '_').replace(/[^a-zA-Z0-9áéíóöőúüűÁÉÍÓÖŐÚÜŰ_]/g, '-')}`;
 
-    // --- CSV KIMENET ---
+    // --- CSV LETÖLTÉS (PONTOSAN AZ EREDETI FORMÁTUMBAN) ---
     if (outputType === 'csv') {
       log('Kimenet formátuma: CSV');
 
       if (apartmentName === 'Everything') {
-        let combinedCsvContent = '\uFEFF'; // UTF-8 BOM Excelhez
+        let combinedCsvContent = '\uFEFF';
 
         for (const name of allApartmentNames) {
           const apartmentData = allBookingData.filter(item => item.propertyName === name);
@@ -189,14 +186,21 @@ export default {
           if (apartmentData.length > 0) {
             const aptTotals = {
               totalNights: apartmentData.reduce((sum, item) => sum + item.nights, 0),
-              totalGuestPaid: `€${apartmentData.reduce((sum, item) => sum + item.totalAmount, 0).toFixed(2)}`,
-              totalCommission: `€${apartmentData.reduce((sum, item) => sum + item.totalAmountTimes015, 0).toFixed(2)}`,
-              totalBankszamlara: `€${apartmentData.reduce((sum, item) => sum + item.totalAmountTimes085, 0).toFixed(2)}`
+              totalGuestPaid: apartmentData.reduce((sum, item) => sum + item.totalAmount, 0),
+              totalCommission: apartmentData.reduce((sum, item) => sum + item.totalAmountTimes015, 0),
+              totalBankszamlara: apartmentData.reduce((sum, item) => sum + item.totalAmountTimes085, 0)
             };
 
-            const aptHeader = `KUNDOLF FERENC, 164 ${name} - ${periodLabel}`;
-            const csvBlock = generateCsv(apartmentData, headers, aptTotals, aptHeader, true);
-            combinedCsvContent += csvBlock + '\n\n';
+            const formattedAptTotals = {
+              totalNights: aptTotals.totalNights,
+              totalGuestPaid: `€${aptTotals.totalGuestPaid.toFixed(2)}`,
+              totalCommission: `€${aptTotals.totalCommission.toFixed(2)}`,
+              totalBankszamlara: `€${aptTotals.totalBankszamlara.toFixed(2)}`
+            };
+
+            const aptHeader = `KUNDOLF FERENC, 164 ${name} - ${headerPeriodText}`;
+            const csvBlock = generateCsv(apartmentData, headers, formattedAptTotals, aptHeader, true);
+            combinedCsvContent += csvBlock;
           }
         }
 
@@ -207,17 +211,19 @@ export default {
           '',
           formattedTotals.totalGuestPaid,
           formattedTotals.totalCommission,
-          '€0.00',
+          `€0.00`,
           formattedTotals.totalBankszamlara,
           ''
         ].map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',');
 
-        combinedCsvContent += `\n${grandTotalRow}\n`;
+        combinedCsvContent += `\n\n${grandTotalRow}\n`;
+
+        const combinedFilename = `KUNDOLF_FERENC_164_OSSZES_APARTMAN_${filenameBase}.csv`;
 
         return new Response(combinedCsvContent, {
           headers: {
             'Content-Type': 'text/csv; charset=utf-8',
-            'Content-Disposition': `attachment; filename="${filenameSafe}.csv"`,
+            'Content-Disposition': `attachment; filename="${combinedFilename}"`,
           },
         });
       }
@@ -226,7 +232,7 @@ export default {
       return new Response(csvContent, {
         headers: {
           'Content-Type': 'text/csv; charset=utf-8',
-          'Content-Disposition': `attachment; filename="${filenameSafe}.csv"`,
+          'Content-Disposition': `attachment; filename="${filenameBase}.csv"`,
         },
       });
     }
@@ -240,11 +246,12 @@ export default {
       tableHeader,
       apartmentName,
       allApartmentNames,
-      periodLabel,
+      headerPeriodText,
       startDateParam,
       endDateParam,
       TARGET_PATH,
-      debugLogs
+      debugLogs,
+      auth.username
     );
 
     return new Response(htmlTable, {
@@ -253,14 +260,49 @@ export default {
   }
 };
 
+// --- AUTHENTICATION SEGÉDFÜGGVÉNYEK ---
+
+function authenticateUser(request) {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    return null;
+  }
+  try {
+    const base64Credentials = authHeader.substring(6).trim();
+    const decoded = atob(base64Credentials);
+    const colonIndex = decoded.indexOf(':');
+    if (colonIndex === -1) return null;
+    const user = decoded.substring(0, colonIndex).trim();
+    const pass = decoded.substring(colonIndex + 1).trim();
+
+    // Felhasználó: Admin (vagy admin), Jelszó: Kurvaanyad1!
+    if (pass === 'Kurvaanyad1!' && (user.toLowerCase() === 'admin' || !user)) {
+      return { role: 'admin', username: user || 'Admin' };
+    }
+    if (pass === 'Kurvaanyad1!') {
+      return { role: 'admin', username: user || 'Admin' };
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function unauthorizedResponse(msg = 'Hozzáférés megtagadva: Kérlek jelentkezz be.') {
+  return new Response(msg, {
+    status: 401,
+    headers: {
+      'WWW-Authenticate': 'Basic realm="Airbnb Tax Accounting", charset="UTF-8"',
+      'Content-Type': 'text/plain; charset=utf-8'
+    }
+  });
+}
+
 // --- DÁTUM SEGÉDFÜGGVÉNYEK ---
 
-function formatDateHU(date) {
+function formatHungarianDate(date) {
   if (!date || isNaN(date.getTime())) return '';
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(date.getUTCDate()).padStart(2, '0');
-  return `${d}.${m}.${y}`;
+  return new Intl.DateTimeFormat('hu-HU', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(date);
 }
 
 function getMonthData() {
@@ -278,7 +320,6 @@ function getMonthData() {
       // Az adott hónap első banki befizetése az előző hónap utolsó napján érkezett vendég után jön (+1 nap)
       const prevMonthLastDay = new Date(Date.UTC(y, m - 1, 0));
       // Az adott hónap utolsó napján bejelentkező vendég pénze már a következő hónapban érkezik!
-      // Ezért az utolsó beszámító érkezési nap: a tárgyhó utolsó napja előtti nap (penultimate day)
       const currMonthLastDay = new Date(Date.UTC(y, m, 0));
       const penultimateDay = new Date(Date.UTC(y, m, -1));
 
@@ -308,48 +349,13 @@ function getMonthData() {
   return list;
 }
 
-function getQuarterData() {
-  const years = [2025, 2026, 2027];
-  const quartersConfig = [
-    { q: 'Q1', endMonth: 3, endDay: 31 },
-    { q: 'Q2', endMonth: 6, endDay: 30 },
-    { q: 'Q3', endMonth: 9, endDay: 30 },
-    { q: 'Q4', endMonth: 12, endDay: 31 }
-  ];
-
-  const list = [];
-  for (const y of years) {
-    for (const item of quartersConfig) {
-      const qNum = parseInt(item.q.replace('Q', ''), 10);
-      const startMonth = (qNum - 1) * 3; // 0, 3, 6, 9
-      const prevQuarterLastDay = new Date(Date.UTC(y, startMonth, 0));
-      const currQuarterLastDay = new Date(Date.UTC(y, item.endMonth, 0));
-      const penultimateDay = new Date(Date.UTC(y, item.endMonth, -1));
-
-      const startStr = prevQuarterLastDay.toISOString().split('T')[0];
-      const endStr = penultimateDay.toISOString().split('T')[0];
-
-      const label = `${item.q} (${y}): ${formatDateHU(prevQuarterLastDay)} – ${formatDateHU(penultimateDay)}`;
-      list.push({
-        q: item.q,
-        year: y,
-        label,
-        value: `${startStr}|${endStr}|${item.q} (${y})`,
-        startStr,
-        endStr
-      });
-    }
-  }
-  return list;
-}
-
-// --- CSV GENERÁLÁS ---
+// --- CSV GENERÁLÁS (PONTOSAN AZ EREDETI OSZLOPOKKAL ÉS STRUKTÚRÁVAL) ---
 
 function generateCsv(data, headers, totals, tableHeader, separate = false) {
   const csvRows = [];
 
   if (separate) {
-    csvRows.push('');
+    csvRows.push('\n');
   }
 
   csvRows.push(`"${tableHeader.replace(/"/g, '""')}"`);
@@ -390,7 +396,10 @@ function generateCsv(data, headers, totals, tableHeader, separate = false) {
     ''
   ];
 
-  const escapedTotalRow = totalRow.map(cell => `"${String(cell).replace(/"/g, '""')}"`);
+  const escapedTotalRow = totalRow.map(cell => {
+    let processedCell = String(cell).replace(/"/g, '""');
+    return `"${processedCell}"`;
+  });
   csvRows.push(escapedTotalRow.join(','));
 
   return csvRows.join('\n');
@@ -405,11 +414,12 @@ function generateHtmlTable(
   tableHeader,
   apartmentName,
   allApartmentNames,
-  periodLabel,
+  headerPeriodText,
   startDateParam,
   endDateParam,
   targetPath,
-  debugLogs
+  debugLogs,
+  username
 ) {
   const isEverything = apartmentName === 'Everything';
 
@@ -456,7 +466,16 @@ function generateHtmlTable(
       box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     }
     h1 { font-size: 20px; font-weight: 700; color: var(--text); }
-    .actions { display: flex; gap: 12px; }
+    .actions { display: flex; gap: 12px; align-items: center; }
+    .user-badge {
+      font-size: 13px;
+      font-weight: 600;
+      background: #f1f5f9;
+      color: #334155;
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
     .btn {
       display: inline-flex;
       align-items: center;
@@ -540,7 +559,7 @@ function generateHtmlTable(
       white-space: nowrap;
     }
     tr:nth-child(even) { background-color: #f8fafc; }
-    tr:hover { background-color: #f1f5f9; }
+    tr:hover { background-color: #f1f1f1; }
     .total-row td {
       font-weight: 700;
       background: #e2e8f0 !important;
@@ -580,9 +599,10 @@ function generateHtmlTable(
         </div>
       </div>
       <div class="actions">
+        <span class="user-badge">👤 ${username}</span>
         <a href="${targetPath}" class="btn btn-secondary">🔍 Új Lekérdezés</a>
         <a href="${targetPath}?customStartDate=${startDateParam}&customEndDate=${endDateParam}&apartment=${encodeURIComponent(apartmentName)}&outputType=csv" class="btn btn-primary">
-          📥 CSV Letöltése
+          📥 CSV Letöltése (Excel)
         </a>
       </div>
     </div>
@@ -597,21 +617,20 @@ function generateHtmlTable(
         <div class="kpi-value">${totals.totalGuestPaid}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-title">Airbnb Jutalék (15%)</div>
+        <div class="kpi-title">Booking/AirBnB jutaléka</div>
         <div class="kpi-value orange">${totals.totalCommission}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-title">Bankszámlára érkezett (85%)</div>
+        <div class="kpi-title">Bankszámlára érkezett összeg</div>
         <div class="kpi-value green">${totals.totalBankszamlara}</div>
       </div>
     </div>
 
     <div class="info-box">
-      💡 <strong>Könyvelési automatizmus:</strong> Az Airbnb az érkezést (Check-in) követő napon utal a bankszámlára.
-      Ezért a hónap első jóváírása az előző hónap utolsó napján érkezett vendég után esedékes, míg a hónap utolsó napján érkező vendég díja már a következő hónapban érkezik a bankszámlára.
+      💡 <strong>Könyvelési szabály:</strong> Az Airbnb az érkezést követő napon utal. Ezért a hónap első banki jóváírása az előző hónap utolsó napján becheckolt vendégtől származik, míg a hónap utolsó napján becheckolt vendég összege már csak a következő hónapban érkezik a számlára.
     </div>
 
-    ${isEverything ? renderEverythingApartments(data, headers, allApartmentNames, periodLabel, totals) : renderSingleApartmentTable(data, headers, totals, tableHeader)}
+    ${isEverything ? renderEverythingApartments(data, headers, allApartmentNames, headerPeriodText, totals) : renderSingleApartmentTable(data, headers, totals, tableHeader)}
 
     <details>
       <summary>Rendszernaplók (Debug Logok)</summary>
@@ -648,7 +667,7 @@ function renderSingleApartmentTable(data, headers, totals, title) {
             </tr>
           `).join('')}
           <tr class="total-row">
-            <td>ÖSSZESEN:</td>
+            <td>Összesen:</td>
             <td></td>
             <td>${totals.totalNights}</td>
             <td></td>
@@ -664,7 +683,7 @@ function renderSingleApartmentTable(data, headers, totals, title) {
   </div>`;
 }
 
-function renderEverythingApartments(data, headers, apartmentNames, periodLabel, grandTotals) {
+function renderEverythingApartments(data, headers, apartmentNames, periodText, grandTotals) {
   let html = '';
 
   for (const name of apartmentNames) {
@@ -680,7 +699,7 @@ function renderEverythingApartments(data, headers, apartmentNames, periodLabel, 
 
     html += `
     <div class="table-section">
-      <div class="table-section-title">🏡 ${name} - ${periodLabel} (${aptData.length} foglalás)</div>
+      <div class="table-section-title">🏡 ${name} - ${periodText} (${aptData.length} foglalás)</div>
       <div class="table-responsive">
         <table>
           <thead>
@@ -703,7 +722,7 @@ function renderEverythingApartments(data, headers, apartmentNames, periodLabel, 
               </tr>
             `).join('')}
             <tr class="total-row">
-              <td>${name} ÖSSZESEN:</td>
+              <td>Összesen:</td>
               <td></td>
               <td>${aptTotals.totalNights}</td>
               <td></td>
@@ -752,10 +771,9 @@ function renderEverythingApartments(data, headers, apartmentNames, periodLabel, 
 
 // --- FORM MEGJELENÍTÉSE ---
 
-function getHtmlForm(targetPath) {
+function getHtmlForm(targetPath, username) {
   const apartmentNames = ['Everything', 'The Tucan', 'The Colibri', 'The Albatros', 'The Pirate', 'The Banana'];
   const monthsData = getMonthData();
-  const quartersData = getQuarterData();
 
   const now = new Date();
   const currentY = now.getFullYear();
@@ -800,6 +818,21 @@ function getHtmlForm(targetPath) {
       border-radius: 16px;
       box-shadow: 0 10px 25px -5px rgba(0,0,0,0.08), 0 8px 10px -6px rgba(0,0,0,0.04);
       border: 1px solid var(--border);
+    }
+    .top-user {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .user-pill {
+      background: #e2e8f0;
+      color: #334155;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-weight: 600;
     }
     h1 {
       font-size: 22px;
@@ -888,13 +921,16 @@ function getHtmlForm(targetPath) {
 </head>
 <body>
   <div class="form-container">
+    <div class="top-user">
+      <span>Bejelentkezve: <strong class="user-pill">🔒 ${username}</strong></span>
+    </div>
     <h1>🗓️ Airbnb Adó- és Könyvelési Lekérdező</h1>
     <p class="subtitle">Automatikus könyvelési dátumok az Airbnb banki jóváírási logikája alapján.</p>
 
     <form method="POST" action="${targetPath}">
-      <!-- 1. Hónap választó (Ajánlott) -->
+      <!-- Hónap választó -->
       <div class="form-group">
-        <label for="month">Könyvelési Hónap (Ajánlott - 1 Hónap Adat):</label>
+        <label for="month">Könyvelési Hónap kiválasztása:</label>
         <select id="month" name="month" onchange="onMonthChange(this.value)">
           <option value="">-- Válassz egy hónapot --</option>
           ${monthsData.map(m => `
@@ -905,27 +941,16 @@ function getHtmlForm(targetPath) {
         </select>
 
         <div id="monthHelp" class="help-card">
-          📅 <strong>Automatikus banki dátum-illesztés:</strong><br>
+          📅 <strong>Automatikus könyvelési dátum-illesztés:</strong><br>
           Az Airbnb a vendég érkezését követő napon indítja a banki átutalást.
           Így az adott hónap első banki jóváírása az <strong>előző hónap utolsó napján becheckolt</strong> vendégtől származik,
           míg az <strong>adott hónap utolsó napján becheckolt</strong> vendég kifizetése már csak a következő hónapban érkezik!
         </div>
       </div>
 
-      <div class="or-divider">VAGY NEGYEDÉV VÁLASZTÁSA</div>
-
-      <!-- 2. Negyedév választó -->
-      <div class="form-group">
-        <label for="quarter">Negyedév (Könyvelési dátumokkal):</label>
-        <select id="quarter" name="quarter" onchange="onQuarterChange(this.value)">
-          <option value="" selected>-- Válassz egy negyedévet --</option>
-          ${quartersData.map(q => `<option value="${q.value}">${q.label}</option>`).join('')}
-        </select>
-      </div>
-
       <div class="or-divider">VAGY EGYEDI DÁTUM MEGADÁSA</div>
 
-      <!-- 3. Egyedi dátum -->
+      <!-- Egyedi dátum -->
       <div class="date-grid">
         <div class="form-group">
           <label for="customStartDate">Kezdő érkezési nap:</label>
@@ -968,14 +993,6 @@ function getHtmlForm(targetPath) {
   <script>
     function onMonthChange(val) {
       if (val) {
-        document.getElementById('quarter').value = '';
-        document.getElementById('customStartDate').value = '';
-        document.getElementById('customEndDate').value = '';
-      }
-    }
-    function onQuarterChange(val) {
-      if (val) {
-        document.getElementById('month').value = '';
         document.getElementById('customStartDate').value = '';
         document.getElementById('customEndDate').value = '';
       }
